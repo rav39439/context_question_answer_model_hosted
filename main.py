@@ -201,8 +201,21 @@ def load_onnx_model():
         local_dir=MODEL_DIR
     )
 
+    session_options = ort.SessionOptions()
+    # Render's small instances expose many host CPUs relative to available RAM.
+    # Unbounded thread pools and the default CPU arena can add avoidable memory
+    # pressure while loading and running this relatively large model.
+    session_options.intra_op_num_threads = int(
+        os.environ.get("ORT_INTRA_OP_THREADS", "1")
+    )
+    session_options.inter_op_num_threads = 1
+    session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    session_options.enable_cpu_mem_arena = False
+    session_options.enable_mem_pattern = False
+
     session = ort.InferenceSession(
         model_path,
+        sess_options=session_options,
         providers=["CPUExecutionProvider"]
     )
 
@@ -1165,6 +1178,6 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=int(os.environ.get("PORT", "8000")),
         reload=False
     )
