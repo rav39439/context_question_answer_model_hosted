@@ -11,6 +11,7 @@ Question -> Tavily -> Retrieved Context
 
 import os
 import json
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -26,17 +27,16 @@ from pydantic import BaseModel, Field
 from huggingface_hub import hf_hub_download
 
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 # =========================================================
 # 1. CONFIGURATION
 # =========================================================
 
-MODEL_DIR = Path("/tmp/models")
+BASE_DIR = Path(__file__).parent
+MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-BASE_DIR = Path(__file__).parent
 DEFAULT_TOKENIZER_DIR = BASE_DIR / "tokenizer"
 
 DEFAULT_TOKENIZER_NAME = "bert-base-uncased"
@@ -72,6 +72,7 @@ tokenizer = None
 model = None
 
 tavily_client = None
+inference_lock = threading.Lock()
 
 
 # =========================================================
@@ -188,18 +189,18 @@ def load_tokenizer(tokenizer_path=None):
 
 def load_onnx_model():
 
-    os.makedirs(
-        MODEL_DIR,
-        exist_ok=True
-    )
+    local_model_path = MODEL_DIR / MODEL_FILENAME
 
-    model_path = hf_hub_download(
-        repo_id=MODEL_REPO_ID,
-        filename=MODEL_FILENAME,
-        repo_type="model",
-        token=os.getenv("HF_TOKEN"),
-        local_dir=MODEL_DIR
-    )
+    if local_model_path.is_file():
+        model_path = str(local_model_path)
+    else:
+        model_path = hf_hub_download(
+            repo_id=MODEL_REPO_ID,
+            filename=MODEL_FILENAME,
+            repo_type="model",
+            token=os.getenv("HF_TOKEN"),
+            local_dir=MODEL_DIR
+        )
 
     session_options = ort.SessionOptions()
     # Render's small instances expose many host CPUs relative to available RAM.
@@ -614,8 +615,9 @@ def generate_next_token(
         dtype=np.int32
     )
 
+    output_name = model.get_outputs()[0].name
     logits = model.run(
-        None,
+        [output_name],
         {
             model.get_inputs()[0].name: input_array
         }
@@ -632,9 +634,10 @@ def generate_next_token(
         next_id = int(np.argmax(next_token_logits))
     else:
         # Temperature-scaled sampling: lower values favor high-scoring tokens.
-        scaled_logits = next_token_logits.astype(np.float64) / temperature
-        scaled_logits -= np.max(scaled_logits)
-        probabilities = np.exp(scaled_logits)
+        probabilities = np.array(next_token_logits, dtype=np.float32, copy=True)
+        np.divide(probabilities, temperature, out=probabilities)
+        probabilities -= np.max(probabilities)
+        np.exp(probabilities, out=probabilities)
         probabilities /= probabilities.sum()
         next_id = int(np.random.choice(len(probabilities), p=probabilities))
 
@@ -675,34 +678,35 @@ def generate_answer(
 
     end_ids = get_end_ids()
 
-    # Autoregressive generation.
-    for step in range(max_gen):
+    # Keep only one request's generation buffers live at a time.
+    with inference_lock:
+        for _ in range(max_gen):
 
-        # Combine prompt and previously generated tokens.
-        context_ids = (
-            token_ids + generated_ids
-        )[-SEQ_LEN:]
+            # Combine prompt and previously generated tokens.
+            context_ids = (
+                token_ids + generated_ids
+            )[-SEQ_LEN:]
 
-        next_id = generate_next_token(
-            context_ids,
-            temperature=temperature
-        )
+            next_id = generate_next_token(
+                context_ids,
+                temperature=temperature
+            )
 
-        generated_ids.append(
-            next_id
-        )
+            generated_ids.append(
+                next_id
+            )
 
-        # Stop-token checking.
-        if (
-            len(generated_ids) >= len(end_ids)
-            and generated_ids[-len(end_ids):] == end_ids
-        ):
+            # Stop-token checking.
+            if (
+                len(generated_ids) >= len(end_ids)
+                and generated_ids[-len(end_ids):] == end_ids
+            ):
 
-            generated_ids = generated_ids[
-                :-len(end_ids)
-            ]
+                generated_ids = generated_ids[
+                    :-len(end_ids)
+                ]
 
-            break
+                break
 
     # Decode answer.
     answer = tokenizer.decode(
@@ -743,42 +747,44 @@ def generate_answer_stream(
 
     end_ids = get_end_ids()
 
-    for step in range(max_gen):
+    # Keep only one request's generation buffers live at a time.
+    with inference_lock:
+        for _ in range(max_gen):
 
-        context_ids = (
-            token_ids + generated_ids
-        )[-SEQ_LEN:]
+            context_ids = (
+                token_ids + generated_ids
+            )[-SEQ_LEN:]
 
-        next_id = generate_next_token(
-            context_ids,
-            temperature=temperature
-        )
+            next_id = generate_next_token(
+                context_ids,
+                temperature=temperature
+            )
 
-        generated_ids.append(
-            next_id
-        )
+            generated_ids.append(
+                next_id
+            )
 
-        # Stop-token checking.
-        if (
-            len(generated_ids) >= len(end_ids)
-            and generated_ids[-len(end_ids):] == end_ids
-        ):
+            # Stop-token checking.
+            if (
+                len(generated_ids) >= len(end_ids)
+                and generated_ids[-len(end_ids):] == end_ids
+            ):
 
-            generated_ids = generated_ids[
-                :-len(end_ids)
-            ]
+                generated_ids = generated_ids[
+                    :-len(end_ids)
+                ]
 
-            break
+                break
 
-        decoded_text = tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
+            decoded_text = tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
 
-        if decoded_text:
+            if decoded_text:
 
-            yield decoded_text
+                yield decoded_text
 
 
 # =========================================================
@@ -901,10 +907,10 @@ form.addEventListener('submit', async (event) => {
     while (!finished) {
       const {value, done} = await reader.read();
       buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
-      const events = buffer.split(/\r?\n\r?\n/);
+      const events = buffer.split(/\\r?\\n\\r?\\n/);
       buffer = events.pop();
       for (const eventText of events) {
-        const line = eventText.split(/\r?\n/).find(line => line.startsWith('data: '));
+        const line = eventText.split(/\\r?\\n/).find(line => line.startsWith('data: '));
         if (!line) continue;
         const data = line.slice(6);
         if (data === '[DONE]') { status.textContent = 'Done'; finished = true; break; }
@@ -1036,7 +1042,7 @@ def has_repeated_token(sentence):
 
 
 def monitor_answer_stream(context, generated_text_stream):
-    """Yield sentence events, terminating on low overlap or repeated words."""
+    """Stream text immediately and stop if a sentence trips a guard."""
 
     previous_text = ""
     pending_text = ""
@@ -1045,6 +1051,9 @@ def monitor_answer_stream(context, generated_text_stream):
         new_text = current_text[len(previous_text):]
         previous_text = current_text
         pending_text += new_text
+
+        if new_text:
+            yield {"token": new_text}
 
         while True:
             boundary = SENTENCE_BOUNDARY.search(pending_text)
@@ -1062,8 +1071,6 @@ def monitor_answer_stream(context, generated_text_stream):
                 yield {"signal": "<terminated>"}
                 return
 
-            yield {"token": sentence}
-
         if has_repeated_token(pending_text):
             yield {"signal": "<terminated>"}
             return
@@ -1074,9 +1081,6 @@ def monitor_answer_stream(context, generated_text_stream):
             or is_hallucinated(pending_text, context)
         ):
             yield {"signal": "<terminated>"}
-            return
-
-        yield {"token": pending_text}
 
 
 @app.post("/generate/stream")
