@@ -33,9 +33,10 @@ load_dotenv()
 # 1. CONFIGURATION
 # =========================================================
 
-MODEL_DIR = "/tmp/models"
-BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = Path("/tmp/models")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+BASE_DIR = Path(__file__).parent
 DEFAULT_TOKENIZER_DIR = BASE_DIR / "tokenizer"
 
 DEFAULT_TOKENIZER_NAME = "bert-base-uncased"
