@@ -20,7 +20,7 @@ from tavily import TavilyClient
 from transformers import BertTokenizerFast
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from huggingface_hub import hf_hub_download
@@ -86,6 +86,12 @@ class QuestionRequest(BaseModel):
         default=MAX_GEN,
         ge=1,
         le=512
+    )
+
+    temperature: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0
     )
 
 
@@ -567,7 +573,8 @@ def prepare_input_tokens(
 # =========================================================
 
 def generate_next_token(
-    token_ids
+    token_ids,
+    temperature=0.0
 ):
 
     """
@@ -608,9 +615,15 @@ def generate_next_token(
         :
     ]
 
-    next_id = int(
-        np.argmax(next_token_logits)
-    )
+    if temperature == 0:
+        next_id = int(np.argmax(next_token_logits))
+    else:
+        # Temperature-scaled sampling: lower values favor high-scoring tokens.
+        scaled_logits = next_token_logits.astype(np.float64) / temperature
+        scaled_logits -= np.max(scaled_logits)
+        probabilities = np.exp(scaled_logits)
+        probabilities /= probabilities.sum()
+        next_id = int(np.random.choice(len(probabilities), p=probabilities))
 
     # Validate generated token ID.
     if next_id >= len(tokenizer):
@@ -631,7 +644,8 @@ def generate_next_token(
 def generate_answer(
     context,
     question,
-    max_gen=MAX_GEN
+    max_gen=MAX_GEN,
+    temperature=0.0
 ):
 
     if max_gen < 1:
@@ -657,7 +671,8 @@ def generate_answer(
         )[-SEQ_LEN:]
 
         next_id = generate_next_token(
-            context_ids
+            context_ids,
+            temperature=temperature
         )
 
         generated_ids.append(
@@ -692,7 +707,8 @@ def generate_answer(
 def generate_answer_stream(
     context,
     question,
-    max_gen=MAX_GEN
+    max_gen=MAX_GEN,
+    temperature=0.0
 ):
 
     """
@@ -721,7 +737,8 @@ def generate_answer_stream(
         )[-SEQ_LEN:]
 
         next_id = generate_next_token(
-            context_ids
+            context_ids,
+            temperature=temperature
         )
 
         generated_ids.append(
@@ -783,6 +800,126 @@ def startup_event():
 # 15. NON-STREAMING API
 # =========================================================
 
+@app.get("/", response_class=HTMLResponse)
+def home():
+    """Serve the lightweight streaming inference interface."""
+    return HTMLResponse("""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Streaming Question Answering</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #182230; background: #f4f7fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px 16px; }
+    main { width: min(760px, 100%); background: white; border: 1px solid #e4eaf2; border-radius: 18px; padding: 28px; box-shadow: 0 16px 45px #19365a12; }
+    h1 { margin: 0 0 8px; font-size: 1.65rem; }
+    .sub { margin: 0 0 24px; color: #65758b; }
+    label { display: block; font-weight: 650; margin: 16px 0 8px; }
+    textarea { width: 100%; min-height: 116px; resize: vertical; padding: 13px; border: 1px solid #cbd5e1; border-radius: 10px; font: inherit; }
+    .controls { display: grid; grid-template-columns: 1fr 120px; gap: 18px; align-items: end; }
+    input[type=range] { width: 100%; accent-color: #3b6eea; }
+    output { display: inline-block; min-width: 38px; font-variant-numeric: tabular-nums; color: #3b6eea; }
+    input[type=number] { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 9px; font: inherit; }
+    button { margin-top: 20px; padding: 11px 18px; border: 0; border-radius: 9px; background: #315fdb; color: white; font: inherit; font-weight: 650; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .status { min-height: 24px; margin: 16px 0 8px; color: #65758b; font-size: .92rem; }
+    section { margin-top: 18px; padding: 16px; border-radius: 11px; background: #f7f9fc; }
+    section h2 { margin: 0 0 10px; font-size: .95rem; color: #53647a; }
+    #answer, #context { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+    #context { max-height: 220px; overflow: auto; color: #53647a; font-size: .9rem; }
+    @media (max-width: 520px) { main { padding: 20px; } .controls { grid-template-columns: 1fr 88px; gap: 10px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Streaming Question Answering</h1>
+  <p class="sub">Ask a question and watch the answer arrive as it is generated.</p>
+  <form id="form">
+    <label for="question">Your question</label>
+    <textarea id="question" required placeholder="What would you like to know?"></textarea>
+    <div class="controls">
+      <div>
+        <label for="temperature">Temperature <output id="temperatureValue">0.7</output></label>
+        <input id="temperature" type="range" min="0" max="1" step="0.05" value="0.7">
+      </div>
+      <div>
+        <label for="maxGen">Max tokens</label>
+        <input id="maxGen" type="number" min="1" max="512" value="150">
+      </div>
+    </div>
+    <button id="submit" type="submit">Generate answer</button>
+  </form>
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+  <section><h2>Streaming answer</h2><div id="answer">Your answer will appear here.</div></section>
+  <section><h2>Retrieved context</h2><div id="context">Context will appear when generation starts.</div></section>
+</main>
+<script>
+const form = document.querySelector('#form');
+const temp = document.querySelector('#temperature');
+const tempValue = document.querySelector('#temperatureValue');
+temp.addEventListener('input', () => tempValue.value = Number(temp.value).toFixed(2).replace(/0+$/, '').replace(/\\.$/, ''));
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = document.querySelector('#submit');
+  const status = document.querySelector('#status');
+  const answer = document.querySelector('#answer');
+  const context = document.querySelector('#context');
+  button.disabled = true;
+  answer.textContent = '';
+  context.textContent = 'Loading context…';
+  status.textContent = 'Searching and starting inference…';
+  try {
+    const response = await fetch('/generate/stream', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: document.querySelector('#question').value,
+        max_gen: Number(document.querySelector('#maxGen').value), temperature: Number(temp.value)})
+    });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail || `Request failed (${response.status})`);
+    }
+    status.textContent = 'Generating…';
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finished = false;
+    while (!finished) {
+      const {value, done} = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop();
+      for (const eventText of events) {
+        const line = eventText.split(/\r?\n/).find(line => line.startsWith('data: '));
+        if (!line) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') { status.textContent = 'Done'; finished = true; break; }
+        if (data === '<terminated>') { status.textContent = 'Generation stopped by the repetition/context guard.'; finished = true; break; }
+        try {
+          const item = JSON.parse(data);
+          if (item.context !== undefined) context.textContent = item.context || '(No context returned)';
+          if (item.token !== undefined) answer.textContent += item.token;
+          if (item.error) throw new Error(item.error);
+        } catch (error) {
+          if (error instanceof SyntaxError) throw error;
+          throw error;
+        }
+      }
+      if (done) finished = true;
+    }
+    if (!answer.textContent) answer.textContent = '(No answer generated)';
+  } catch (error) {
+    status.textContent = `Error: ${error.message}`;
+    if (context.textContent === 'Loading context…') context.textContent = 'Context unavailable.';
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>""")
+
 @app.post("/generate")
 def generate(
     request: QuestionRequest
@@ -801,7 +938,8 @@ def generate(
         answer = generate_answer(
             context=context,
             question=request.question,
-            max_gen=request.max_gen
+            max_gen=request.max_gen,
+            temperature=request.temperature
         )
 
         # STEP 3: Return response.
@@ -968,7 +1106,8 @@ def generate_stream(
             generated_text_stream = generate_answer_stream(
                 context=context,
                 question=request.question,
-                max_gen=request.max_gen
+                max_gen=request.max_gen,
+                temperature=request.temperature
             )
 
             for event in monitor_answer_stream(
