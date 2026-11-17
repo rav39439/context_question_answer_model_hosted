@@ -3,7 +3,436 @@
 
 
 
-"""Load the instruction-tuned decoder and generate answers using ONNX Runtime."""
+# """Load the instruction-tuned decoder and generate answers using ONNX Runtime."""
+
+# import os
+# import json
+# from pathlib import Path
+
+# import numpy as np
+# import onnxruntime as ort
+# from transformers import BertTokenizerFast
+
+# from fastapi import FastAPI
+# from fastapi.responses import StreamingResponse
+# from pydantic import BaseModel
+# from huggingface_hub import hf_hub_download
+
+# MODEL_DIR = "/var/data/models"
+
+# BASE_DIR = Path(__file__).resolve().parent
+# ONNX_PATH = BASE_DIR / "final_instruction_tuned.onnx"
+# DEFAULT_TOKENIZER_DIR = BASE_DIR / "tokenizer"
+# DEFAULT_TOKENIZER_NAME = "bert-base-uncased"
+# EXPECTED_VOCAB_SIZE = 30522
+
+
+# app = FastAPI()
+
+# tokenizer = None
+# model = None
+
+
+# class QuestionRequest(BaseModel):
+#     question: str
+#     max_gen: int = 250
+
+
+# def load_tokenizer(tokenizer_path=None):
+#     """Load the checkpoint's tokenizer from a local path or BERT fallback."""
+
+#     configured_path = (
+#         tokenizer_path
+#         or os.environ.get("NEW_MODEL_TOKENIZER_PATH")
+#     )
+
+#     if configured_path:
+#         tokenizer_source = Path(configured_path).expanduser()
+#         if not tokenizer_source.exists():
+#             raise FileNotFoundError(
+#                 "Tokenizer path does not exist: "
+#                 f"{tokenizer_source}. Set NEW_MODEL_TOKENIZER_PATH to the "
+#                 "directory containing the trained tokenizer."
+#             )
+#     elif DEFAULT_TOKENIZER_DIR.is_dir():
+#         tokenizer_source = DEFAULT_TOKENIZER_DIR
+#     else:
+#         tokenizer_source = os.environ.get(
+#             "NEW_MODEL_TOKENIZER_NAME",
+#             DEFAULT_TOKENIZER_NAME,
+#         )
+
+#     tokenizer = BertTokenizerFast.from_pretrained(str(tokenizer_source))
+
+#     actual_vocab_size = len(tokenizer)
+
+#     if actual_vocab_size != EXPECTED_VOCAB_SIZE:
+#         raise ValueError(
+#             "Tokenizer vocabulary does not match the model checkpoint: "
+#             f"expected {EXPECTED_VOCAB_SIZE}, got {actual_vocab_size} "
+#             f"from {tokenizer_source}."
+#         )
+
+#     return tokenizer
+
+
+# # def load_onnx_model(onnx_path=ONNX_PATH):
+# #     """Load the trained ONNX model."""
+
+# #     onnx_path = Path(onnx_path)
+
+# #     if not onnx_path.is_file():
+# #         raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+
+# #     session = ort.InferenceSession(
+# #         str(onnx_path),
+# #         providers=["CPUExecutionProvider"]
+# #     )
+
+# #     return session
+
+# def load_onnx_model():
+
+#     model_path = hf_hub_download(
+#         repo_id="rav39439/summerization-model",
+#         filename="final_instruction_tuned.onnx",
+#         repo_type="model",
+#         token=os.getenv("HF_TOKEN"),
+#         local_dir=MODEL_DIR
+#     )
+
+#     return ort.InferenceSession(
+#         model_path,
+#         providers=["CPUExecutionProvider"]
+#     )
+
+
+# def positional_encoding_np(position, d_model):
+#     angle_rads = np.arange(position)[:, np.newaxis] / np.power(
+#         10000,
+#         (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model)
+#     )
+
+#     angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+#     angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+
+#     return angle_rads[np.newaxis, ...].astype(np.float32)
+
+
+# def generate_answer(model, tokenizer, question, seq_len=256, max_gen=150):
+
+#     if seq_len < 2:
+#         raise ValueError("seq_len must be at least 2.")
+
+#     if max_gen < 1:
+#         return ""
+
+#     prompt = f"Question: {question}\nAnswer:"
+
+#     token_ids = tokenizer.encode(
+#         prompt,
+#         add_special_tokens=False
+#     )
+
+#     if not token_ids:
+#         raise ValueError("Question produced no tokens.")
+
+#     context_limit = seq_len - 1
+#     token_ids = token_ids[-context_limit:]
+
+#     generated_ids = []
+
+#     end_ids = tokenizer.encode(
+#         "\nEnd of answer.",
+#         add_special_tokens=False,
+#     )
+
+#     inputs = model.get_inputs()
+
+#     # Identify both ONNX inputs.
+#     input_names = [inp.name for inp in inputs]
+
+#     print("ONNX inputs:")
+#     for inp in inputs:
+#         print(inp.name, inp.shape, inp.type)
+
+#     # Identify token input and positional encoding input.
+#     token_input = inputs[0]
+#     positional_input = inputs[1]
+
+#     token_dtype = (
+#         np.int64
+#         if token_input.type == "tensor(int64)"
+#         else np.int32
+#     )
+
+#     # Get positional encoding dimension from ONNX input shape.
+#     d_model = positional_input.shape[-1]
+
+#     if not isinstance(d_model, int):
+#         raise ValueError(
+#             f"Invalid positional encoding dimension: {d_model}"
+#         )
+
+#     pe = positional_encoding_np(seq_len, d_model)
+
+#     for _ in range(max_gen):
+
+#         input_seq = np.array(
+#             [token_ids],
+#             dtype=token_dtype
+#         )
+
+#         # Supply both required ONNX inputs.
+#         feed = {
+#             token_input.name: input_seq,
+#             positional_input.name: pe
+#         }
+
+#         logits = model.run(None, feed)[0]
+
+#         next_id_value = int(
+#             np.argmax(logits[0, -1, :])
+#         )
+
+#         generated_ids.append(next_id_value)
+
+#         if (
+#             end_ids
+#             and len(generated_ids) >= len(end_ids)
+#             and generated_ids[-len(end_ids):] == end_ids
+#         ):
+#             generated_ids = generated_ids[:-len(end_ids)]
+#             break
+
+#         token_ids.append(next_id_value)
+
+#         if len(token_ids) > context_limit:
+#             token_ids = token_ids[-context_limit:]
+
+#     return tokenizer.decode(
+#         generated_ids,
+#         skip_special_tokens=True
+#     ).strip()
+
+
+# # =========================================================
+# # STREAMING GENERATION
+# # =========================================================
+
+# def generate_answer_stream(
+#     model,
+#     tokenizer,
+#     question,
+#     seq_len=256,
+#     max_gen=150
+# ):
+#     """Generate and yield decoded text as tokens are produced."""
+
+#     if seq_len < 2:
+#         raise ValueError("seq_len must be at least 2.")
+
+#     if max_gen < 1:
+#         return
+
+#     prompt = f"Question: {question}\nAnswer:"
+
+#     token_ids = tokenizer.encode(
+#         prompt,
+#         add_special_tokens=False
+#     )
+
+#     if not token_ids:
+#         raise ValueError("Question produced no tokens.")
+
+#     context_limit = seq_len - 1
+#     token_ids = token_ids[-context_limit:]
+
+#     end_ids = tokenizer.encode(
+#         "\nEnd of answer.",
+#         add_special_tokens=False,
+#     )
+
+#     inputs = model.get_inputs()
+
+#     token_input = inputs[0]
+#     positional_input = inputs[1]
+
+#     token_dtype = (
+#         np.int64
+#         if token_input.type == "tensor(int64)"
+#         else np.int32
+#     )
+
+#     d_model = positional_input.shape[-1]
+
+#     if not isinstance(d_model, int):
+#         raise ValueError(
+#             f"Invalid positional encoding dimension: {d_model}"
+#         )
+
+#     pe = positional_encoding_np(seq_len, d_model)
+
+#     generated_ids = []
+
+#     for _ in range(max_gen):
+
+#         input_seq = np.array(
+#             [token_ids],
+#             dtype=token_dtype
+#         )
+
+#         feed = {
+#             token_input.name: input_seq,
+#             positional_input.name: pe
+#         }
+
+#         logits = model.run(None, feed)[0]
+
+#         next_id_value = int(
+#             np.argmax(logits[0, -1, :])
+#         )
+
+#         # Stop at SEP or EOS.
+#         if next_id_value in [
+#             tokenizer.sep_token_id,
+#             tokenizer.eos_token_id
+#         ]:
+#             break
+
+#         generated_ids.append(next_id_value)
+
+#         # Preserve the existing end phrase stopping logic.
+#         if (
+#             end_ids
+#             and len(generated_ids) >= len(end_ids)
+#             and generated_ids[-len(end_ids):] == end_ids
+#         ):
+#             generated_ids = generated_ids[:-len(end_ids)]
+#             break
+
+#         token_ids.append(next_id_value)
+
+#         if len(token_ids) > context_limit:
+#             token_ids = token_ids[-context_limit:]
+
+#         # Decode generated tokens and stream only newly completed text.
+#         decoded_text = tokenizer.decode(
+#             generated_ids,
+#             skip_special_tokens=True,
+#             clean_up_tokenization_spaces=True
+#         )
+
+#         if decoded_text:
+#             yield decoded_text
+
+#             # Keep the generated text in sync with the streamed text.
+#             # The complete decoded prefix is sent to the client.
+
+
+# # =========================================================
+# # FASTAPI ROUTES
+# # =========================================================
+
+# @app.on_event("startup")
+# def startup_event():
+
+#     global tokenizer, model
+
+#     tokenizer = load_tokenizer()
+#     model = load_onnx_model()
+
+#     print("Tokenizer and ONNX model loaded successfully.")
+
+
+# @app.post("/generate")
+# def generate(request: QuestionRequest):
+
+#     answer = generate_answer(
+#         model=model,
+#         tokenizer=tokenizer,
+#         question=request.question,
+#         max_gen=request.max_gen
+#     )
+
+#     return {
+#         "question": request.question,
+#         "answer": answer
+#     }
+
+
+# @app.post("/generate/stream")
+# def generate_stream(request: QuestionRequest):
+
+#     def stream():
+
+#         try:
+#             previous_text = ""
+
+#             for current_text in generate_answer_stream(
+#                 model=model,
+#                 tokenizer=tokenizer,
+#                 question=request.question,
+#                 max_gen=request.max_gen
+#             ):
+
+#                 # Send only the newly generated portion.
+#                 new_text = current_text[len(previous_text):]
+
+#                 if new_text:
+#                     yield f"data: {json.dumps({'token': new_text})}\n\n"
+
+#                 previous_text = current_text
+
+#             yield "data: [DONE]\n\n"
+
+#         except Exception as e:
+
+#             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+#     return StreamingResponse(
+#         stream(),
+#         media_type="text/event-stream",
+#         headers={
+#             "Cache-Control": "no-cache",
+#             "Connection": "keep-alive",
+#             "X-Accel-Buffering": "no"
+#         }
+#     )
+
+
+# # =========================================================
+# # MAIN
+# # =========================================================
+
+# if __name__ == "__main__":
+
+#     import uvicorn
+
+#     uvicorn.run(
+#         app,
+#         host="0.0.0.0",
+#         port=8000,
+#          reload=True
+#     )
+
+#     # uvicorn.run(
+#     #     app,
+#     #     host="0.0.0.0",
+#     #     port=8000,
+#     #     reload=True
+#     # )
+
+
+
+"""
+ONNX Decoder-Only Transformer
+Tavily Context Retrieval + Question Answering
+
+Flow:
+Question -> Tavily -> Retrieved Context
+         -> Context + Question -> ONNX -> Answer
+"""
 
 import os
 import json
@@ -11,35 +440,86 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+
+from tavily import TavilyClient
 from transformers import BertTokenizerFast
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
 from huggingface_hub import hf_hub_download
+
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+# =========================================================
+# 1. CONFIGURATION
+# =========================================================
 
 MODEL_DIR = "/var/data/models"
 
 BASE_DIR = Path(__file__).resolve().parent
-ONNX_PATH = BASE_DIR / "final_instruction_tuned.onnx"
+
 DEFAULT_TOKENIZER_DIR = BASE_DIR / "tokenizer"
+
 DEFAULT_TOKENIZER_NAME = "bert-base-uncased"
-EXPECTED_VOCAB_SIZE = 30522
+
+MODEL_REPO_ID = "rav39439/summerization-model"
+
+MODEL_FILENAME = "context_question_answer.onnx"
+
+SEQ_LEN = 512
+
+MAX_GEN = 150
+
+MAX_CONTEXT_RESULTS = 4
+
+MAX_CONTEXT_CHARACTERS = 5000
+
+# Replace with the exact END_IDS used during training.
+# SEP is used here as in your supplied inference code.
 
 
-app = FastAPI()
+# =========================================================
+# 2. FASTAPI INITIALIZATION
+# =========================================================
+
+app = FastAPI(
+    title="ONNX Transformer Context QA API",
+    description="Tavily-powered context-based question answering",
+    version="1.0"
+)
 
 tokenizer = None
+
 model = None
 
+tavily_client = None
+
+
+# =========================================================
+# 3. REQUEST MODEL
+# =========================================================
 
 class QuestionRequest(BaseModel):
+
     question: str
-    max_gen: int = 250
+
+    max_gen: int = Field(
+        default=MAX_GEN,
+        ge=1,
+        le=512
+    )
+
+
+# =========================================================
+# 4. LOAD TOKENIZER
+# =========================================================
 
 
 def load_tokenizer(tokenizer_path=None):
-    """Load the checkpoint's tokenizer from a local path or BERT fallback."""
 
     configured_path = (
         tokenizer_path
@@ -47,87 +527,446 @@ def load_tokenizer(tokenizer_path=None):
     )
 
     if configured_path:
-        tokenizer_source = Path(configured_path).expanduser()
+
+        tokenizer_source = Path(
+            configured_path
+        ).expanduser()
+
         if not tokenizer_source.exists():
+
             raise FileNotFoundError(
-                "Tokenizer path does not exist: "
-                f"{tokenizer_source}. Set NEW_MODEL_TOKENIZER_PATH to the "
-                "directory containing the trained tokenizer."
+                f"Tokenizer path does not exist: {tokenizer_source}"
             )
+
     elif DEFAULT_TOKENIZER_DIR.is_dir():
+
         tokenizer_source = DEFAULT_TOKENIZER_DIR
+
     else:
+
         tokenizer_source = os.environ.get(
             "NEW_MODEL_TOKENIZER_NAME",
-            DEFAULT_TOKENIZER_NAME,
+            DEFAULT_TOKENIZER_NAME
         )
 
-    tokenizer = BertTokenizerFast.from_pretrained(str(tokenizer_source))
+    loaded_tokenizer = BertTokenizerFast.from_pretrained(
+        str(tokenizer_source)
+    )
 
-    actual_vocab_size = len(tokenizer)
+    # Do not add tokens if they are already present.
+    special_tokens = [
+        "<question>",
+        "</question>",
+        "<answer>",
+        "</answer>",
+        "<END>"
+    ]
 
-    if actual_vocab_size != EXPECTED_VOCAB_SIZE:
-        raise ValueError(
-            "Tokenizer vocabulary does not match the model checkpoint: "
-            f"expected {EXPECTED_VOCAB_SIZE}, got {actual_vocab_size} "
-            f"from {tokenizer_source}."
+    missing_tokens = [
+        token
+        for token in special_tokens
+        if token not in loaded_tokenizer.get_vocab()
+    ]
+
+    if missing_tokens:
+
+        loaded_tokenizer.add_special_tokens({
+            "additional_special_tokens": missing_tokens
+        })
+
+    # print("\nTokenizer loaded successfully.")
+
+    # print("Tokenizer length:", len(loaded_tokenizer))
+
+    # print("Vocabulary size:", loaded_tokenizer.vocab_size)
+
+    # print("Special tokens:")
+
+    for token in special_tokens:
+
+        print(
+            token,
+            "->",
+            loaded_tokenizer.convert_tokens_to_ids(token)
         )
 
-    return tokenizer
+    print("PAD token ID:", loaded_tokenizer.pad_token_id)
+
+    print("SEP token ID:", loaded_tokenizer.sep_token_id)
+
+    if loaded_tokenizer.pad_token_id is None:
+
+        raise ValueError("Tokenizer PAD token is missing.")
+
+    return loaded_tokenizer
 
 
-# def load_onnx_model(onnx_path=ONNX_PATH):
-#     """Load the trained ONNX model."""
-
-#     onnx_path = Path(onnx_path)
-
-#     if not onnx_path.is_file():
-#         raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
-
-#     session = ort.InferenceSession(
-#         str(onnx_path),
-#         providers=["CPUExecutionProvider"]
-#     )
-
-#     return session
+# =========================================================
+# 5. LOAD ONNX MODEL
+# =========================================================
 
 def load_onnx_model():
 
+    os.makedirs(
+        MODEL_DIR,
+        exist_ok=True
+    )
+
     model_path = hf_hub_download(
-        repo_id="rav39439/summerization-model",
-        filename="final_instruction_tuned.onnx",
+        repo_id=MODEL_REPO_ID,
+        filename=MODEL_FILENAME,
         repo_type="model",
         token=os.getenv("HF_TOKEN"),
         local_dir=MODEL_DIR
     )
 
-    return ort.InferenceSession(
+    session = ort.InferenceSession(
         model_path,
         providers=["CPUExecutionProvider"]
     )
 
+    # -----------------------------------------------------
+    # Validate ONNX inputs
+    # -----------------------------------------------------
 
-def positional_encoding_np(position, d_model):
-    angle_rads = np.arange(position)[:, np.newaxis] / np.power(
-        10000,
-        (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model)
+    if len(session.get_inputs()) != 1:
+
+        raise ValueError(
+            "Expected exactly one ONNX input."
+        )
+
+    input_info = session.get_inputs()[0]
+
+    if input_info.type != "tensor(int32)":
+
+        raise TypeError(
+            f"Expected tensor(int32), got {input_info.type}"
+        )
+
+    print("\nONNX model loaded successfully.")
+
+    print("Input name:", input_info.name)
+
+    print("Input shape:", input_info.shape)
+
+    print("Output name:", session.get_outputs()[0].name)
+
+    print("Output shape:", session.get_outputs()[0].shape)
+
+    return session
+
+
+# =========================================================
+# 6. INITIALIZE TAVILY
+# =========================================================
+
+# def load_tavily_client():
+
+#     api_key = os.getenv("TAVILY_API_KEY")
+
+#     if not api_key:
+
+#         raise RuntimeError(
+#             "TAVILY_API_KEY environment variable is missing."
+#         )
+
+#     return TavilyClient(
+#         api_key=api_key
+#     )
+from tavily import TavilyClient
+import os
+
+def load_tavily_client():
+    api_key = os.getenv("TAVILY_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "TAVILY_API_KEY is missing. Check your .env file."
+        )
+
+    print("Tavily API key loaded successfully.")
+
+    return TavilyClient(api_key=api_key)
+
+# =========================================================
+# 7. TAVILY WEB SEARCH
+# =========================================================
+
+# def search_web_context(question):
+
+#     """
+#     Retrieve web information using the user's question.
+
+#     Returns:
+#         context: Retrieved content.
+#         sources: Source titles and URLs.
+#     """
+
+#     if tavily_client is None:
+
+#         raise RuntimeError(
+#             "Tavily client is not initialized."
+#         )
+
+#     print("\nSearching Tavily...")
+
+#     print("Question:", question)
+
+#     response = tavily_client.search(
+#         query=question[:400],
+#         search_depth="basic",
+#         topic="general",
+#         max_results=MAX_CONTEXT_RESULTS,
+#         include_answer=False,
+#         include_raw_content=False
+#     )
+
+#     results = response.get(
+#         "results",
+#         []
+#     )
+
+#     context_parts = []
+
+#     sources = []
+
+#     for index, result in enumerate(
+#         results,
+#         start=1
+#     ):
+
+#         title = result.get(
+#             "title",
+#             "Untitled"
+#         )
+
+#         content = result.get(
+#             "content",
+#             ""
+#         )
+
+#         url = result.get(
+#             "url",
+#             ""
+#         )
+
+#         if not content:
+
+#             continue
+
+#         context_parts.append(
+#             f"""
+# Source {index}:
+# Title: {title}
+# Content: {content}
+# URL: {url}
+# """.strip()
+#         )
+
+#         sources.append({
+
+#             "title": title,
+
+#             "url": url
+
+#         })
+
+#     context = "\n\n".join(
+#         context_parts
+#     )
+
+#     context = context[:MAX_CONTEXT_CHARACTERS]
+
+#     # print(
+#     #     "Retrieved sources:",
+#     #     len(sources)
+#     # )
+
+#     return context, sources
+
+
+import re
+
+
+def search_web_context(question):
+
+    """
+    Retrieve clean textual context using Tavily.
+
+    Returns:
+        context: Plain-text paragraphs limited to 600 tokens.
+        sources: Source titles and URLs (separate from context).
+    """
+
+    if tavily_client is None:
+        raise RuntimeError(
+            "Tavily client is not initialized."
+        )
+
+    MAX_CONTEXT_TOKENS = 600
+
+    print("\nSearching Tavily...")
+    print("Question:", question)
+
+    response = tavily_client.search(
+        query=question[:400],
+        search_depth="basic",
+        topic="general",
+        max_results=MAX_CONTEXT_RESULTS,
+        include_answer=False,
+        include_raw_content=False
     )
 
-    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
-    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+    results = response.get("results", [])
 
-    return angle_rads[np.newaxis, ...].astype(np.float32)
+    context_parts = []
+    sources = []
+
+    for result in results:
+
+        content = result.get("content", "")
+
+        if not content:
+            continue
+
+        # Remove HTML tags.
+        content = re.sub(
+            r"<[^>]+>",
+            " ",
+            content
+        )
+
+        # Remove URLs.
+        content = re.sub(
+            r"https?://\S+",
+            "",
+            content
+        )
+
+        # Remove Markdown images and links.
+        content = re.sub(
+            r"!\[.*?\]\(.*?\)",
+            "",
+            content
+        )
+
+        content = re.sub(
+            r"\[(.*?)\]\(.*?\)",
+            r"\1",
+            content
+        )
+
+        # Normalize whitespace.
+        content = re.sub(
+            r"\s+",
+            " ",
+            content
+        ).strip()
+
+        if not content:
+            continue
+
+        context_parts.append(content)
+
+        # Sources remain separate from context.
+        sources.append({
+            "title": result.get("title", "Untitled"),
+            "url": result.get("url", "")
+        })
+
+    # Combine only textual paragraphs.
+    context = "\n\n".join(context_parts)
+
+    # Enforce an actual 600-token limit.
+    tokens = tokenizer.encode(
+        context,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=MAX_CONTEXT_TOKENS
+    )
+
+    context = tokenizer.decode(
+        tokens,
+        skip_special_tokens=True
+    )
+
+    print("Retrieved sources:", len(sources))
+    print("Context tokens:", len(tokens))
+
+    return context, sources
 
 
-def generate_answer(model, tokenizer, question, seq_len=256, max_gen=150):
+# =========================================================
+# 8. VALIDATE TOKENIZER AND MODEL VOCABULARY
+# =========================================================
 
-    if seq_len < 2:
-        raise ValueError("seq_len must be at least 2.")
+def validate_vocabulary():
 
-    if max_gen < 1:
-        return ""
+    model_vocab_size = model.get_outputs()[0].shape[-1]
 
-    prompt = f"Question: {question}\nAnswer:"
+    print("\nModel output vocabulary:", model_vocab_size)
+
+    print("Tokenizer length:", len(tokenizer))
+
+    if len(tokenizer) != model_vocab_size:
+
+        raise ValueError(
+            "Tokenizer/model vocabulary mismatch. "
+            f"Tokenizer: {len(tokenizer)}, "
+            f"Model: {model_vocab_size}"
+        )
+
+# =========================================================
+# 9. END TOKEN CONFIGURATION
+# =========================================================
+
+def get_end_ids():
+
+    # Use the exact END_IDS from training.
+    # SEP is used as the default.
+
+    end_ids = [
+        tokenizer.sep_token_id
+    ]
+
+    if any(
+        token_id is None
+        for token_id in end_ids
+    ):
+
+        raise ValueError(
+            "Invalid END_IDS configuration."
+        )
+
+    print("End token IDs:", end_ids)
+
+    return end_ids
+
+
+# =========================================================
+# 10. PREPARE CONTEXT + QUESTION PROMPT
+# =========================================================
+
+def prepare_input_tokens(
+    context,
+    question
+):
+
+    """
+    Prompt format:
+
+    Context: Retrieved information
+
+    Question: User question
+
+    Answer:
+    """
+
+    prompt = (
+        f"Context: {context}\n"
+        f"Question: {question}\n"
+        f"Answer:"
+    )
 
     token_ids = tokenizer.encode(
         prompt,
@@ -135,188 +974,197 @@ def generate_answer(model, tokenizer, question, seq_len=256, max_gen=150):
     )
 
     if not token_ids:
-        raise ValueError("Question produced no tokens.")
 
-    context_limit = seq_len - 1
-    token_ids = token_ids[-context_limit:]
+        raise ValueError(
+            "Context and question produced no tokens."
+        )
+
+    # Preserve the end of the prompt.
+    token_ids = token_ids[
+        -(SEQ_LEN - 1):
+    ]
+
+    return token_ids
+
+
+# =========================================================
+# 11. SINGLE ONNX GENERATION STEP
+# =========================================================
+
+def generate_next_token(
+    token_ids
+):
+
+    """
+    Execute one ONNX inference step.
+
+    Input:
+        Fixed-length int32 array of 512 tokens.
+
+    Output:
+        Next predicted token ID.
+    """
+
+    actual_length = len(token_ids)
+
+    # Fixed-length right padding.
+    padded_ids = (
+        token_ids
+        + [tokenizer.pad_token_id] *
+        (SEQ_LEN - actual_length)
+    )
+
+    input_array = np.asarray(
+        [padded_ids],
+        dtype=np.int32
+    )
+
+    logits = model.run(
+        None,
+        {
+            model.get_inputs()[0].name: input_array
+        }
+    )[0]
+
+    # Select logits at the last actual token position.
+    next_token_logits = logits[
+        0,
+        actual_length - 1,
+        :
+    ]
+
+    next_id = int(
+        np.argmax(next_token_logits)
+    )
+
+    # Validate generated token ID.
+    if next_id >= len(tokenizer):
+
+        raise ValueError(
+            f"Generated token ID {next_id} is outside "
+            f"the tokenizer vocabulary ({len(tokenizer)}). "
+            "Check the tokenizer used during training."
+        )
+
+    return next_id
+
+
+# =========================================================
+# 12. COMPLETE ANSWER GENERATION
+# =========================================================
+
+def generate_answer(
+    context,
+    question,
+    max_gen=MAX_GEN
+):
+
+    if max_gen < 1:
+
+        return ""
+
+    # Prepare prompt.
+    token_ids = prepare_input_tokens(
+        context=context,
+        question=question
+    )
 
     generated_ids = []
 
-    end_ids = tokenizer.encode(
-        "\nEnd of answer.",
-        add_special_tokens=False,
-    )
+    end_ids = get_end_ids()
 
-    inputs = model.get_inputs()
+    # Autoregressive generation.
+    for step in range(max_gen):
 
-    # Identify both ONNX inputs.
-    input_names = [inp.name for inp in inputs]
+        # Combine prompt and previously generated tokens.
+        context_ids = (
+            token_ids + generated_ids
+        )[-SEQ_LEN:]
 
-    print("ONNX inputs:")
-    for inp in inputs:
-        print(inp.name, inp.shape, inp.type)
-
-    # Identify token input and positional encoding input.
-    token_input = inputs[0]
-    positional_input = inputs[1]
-
-    token_dtype = (
-        np.int64
-        if token_input.type == "tensor(int64)"
-        else np.int32
-    )
-
-    # Get positional encoding dimension from ONNX input shape.
-    d_model = positional_input.shape[-1]
-
-    if not isinstance(d_model, int):
-        raise ValueError(
-            f"Invalid positional encoding dimension: {d_model}"
+        next_id = generate_next_token(
+            context_ids
         )
 
-    pe = positional_encoding_np(seq_len, d_model)
-
-    for _ in range(max_gen):
-
-        input_seq = np.array(
-            [token_ids],
-            dtype=token_dtype
+        generated_ids.append(
+            next_id
         )
 
-        # Supply both required ONNX inputs.
-        feed = {
-            token_input.name: input_seq,
-            positional_input.name: pe
-        }
-
-        logits = model.run(None, feed)[0]
-
-        next_id_value = int(
-            np.argmax(logits[0, -1, :])
-        )
-
-        generated_ids.append(next_id_value)
-
+        # Stop-token checking.
         if (
-            end_ids
-            and len(generated_ids) >= len(end_ids)
+            len(generated_ids) >= len(end_ids)
             and generated_ids[-len(end_ids):] == end_ids
         ):
-            generated_ids = generated_ids[:-len(end_ids)]
+
+            generated_ids = generated_ids[
+                :-len(end_ids)
+            ]
+
             break
 
-        token_ids.append(next_id_value)
-
-        if len(token_ids) > context_limit:
-            token_ids = token_ids[-context_limit:]
-
-    return tokenizer.decode(
+    # Decode answer.
+    answer = tokenizer.decode(
         generated_ids,
         skip_special_tokens=True
     ).strip()
 
+    return answer
+
 
 # =========================================================
-# STREAMING GENERATION
+# 13. STREAMING ANSWER GENERATION
 # =========================================================
 
 def generate_answer_stream(
-    model,
-    tokenizer,
+    context,
     question,
-    seq_len=256,
-    max_gen=150
+    max_gen=MAX_GEN
 ):
-    """Generate and yield decoded text as tokens are produced."""
 
-    if seq_len < 2:
-        raise ValueError("seq_len must be at least 2.")
+    """
+    Generate and yield the complete decoded prefix.
+
+    The API endpoint sends only newly generated text.
+    """
 
     if max_gen < 1:
+
         return
 
-    prompt = f"Question: {question}\nAnswer:"
-
-    token_ids = tokenizer.encode(
-        prompt,
-        add_special_tokens=False
+    token_ids = prepare_input_tokens(
+        context=context,
+        question=question
     )
-
-    if not token_ids:
-        raise ValueError("Question produced no tokens.")
-
-    context_limit = seq_len - 1
-    token_ids = token_ids[-context_limit:]
-
-    end_ids = tokenizer.encode(
-        "\nEnd of answer.",
-        add_special_tokens=False,
-    )
-
-    inputs = model.get_inputs()
-
-    token_input = inputs[0]
-    positional_input = inputs[1]
-
-    token_dtype = (
-        np.int64
-        if token_input.type == "tensor(int64)"
-        else np.int32
-    )
-
-    d_model = positional_input.shape[-1]
-
-    if not isinstance(d_model, int):
-        raise ValueError(
-            f"Invalid positional encoding dimension: {d_model}"
-        )
-
-    pe = positional_encoding_np(seq_len, d_model)
 
     generated_ids = []
 
-    for _ in range(max_gen):
+    end_ids = get_end_ids()
 
-        input_seq = np.array(
-            [token_ids],
-            dtype=token_dtype
+    for step in range(max_gen):
+
+        context_ids = (
+            token_ids + generated_ids
+        )[-SEQ_LEN:]
+
+        next_id = generate_next_token(
+            context_ids
         )
 
-        feed = {
-            token_input.name: input_seq,
-            positional_input.name: pe
-        }
-
-        logits = model.run(None, feed)[0]
-
-        next_id_value = int(
-            np.argmax(logits[0, -1, :])
+        generated_ids.append(
+            next_id
         )
 
-        # Stop at SEP or EOS.
-        if next_id_value in [
-            tokenizer.sep_token_id,
-            tokenizer.eos_token_id
-        ]:
-            break
-
-        generated_ids.append(next_id_value)
-
-        # Preserve the existing end phrase stopping logic.
+        # Stop-token checking.
         if (
-            end_ids
-            and len(generated_ids) >= len(end_ids)
+            len(generated_ids) >= len(end_ids)
             and generated_ids[-len(end_ids):] == end_ids
         ):
-            generated_ids = generated_ids[:-len(end_ids)]
+
+            generated_ids = generated_ids[
+                :-len(end_ids)
+            ]
+
             break
 
-        token_ids.append(next_id_value)
-
-        if len(token_ids) > context_limit:
-            token_ids = token_ids[-context_limit:]
-
-        # Decode generated tokens and stream only newly completed text.
         decoded_text = tokenizer.decode(
             generated_ids,
             skip_special_tokens=True,
@@ -324,85 +1172,276 @@ def generate_answer_stream(
         )
 
         if decoded_text:
-            yield decoded_text
 
-            # Keep the generated text in sync with the streamed text.
-            # The complete decoded prefix is sent to the client.
+            yield decoded_text
 
 
 # =========================================================
-# FASTAPI ROUTES
+# 14. STARTUP EVENT
 # =========================================================
 
 @app.on_event("startup")
 def startup_event():
 
-    global tokenizer, model
+    global tokenizer
+    global model
+    global tavily_client
+
+    print("\nLoading tokenizer...")
 
     tokenizer = load_tokenizer()
+
+    print("\nLoading ONNX model...")
+
     model = load_onnx_model()
 
-    print("Tokenizer and ONNX model loaded successfully.")
+    validate_vocabulary()
 
+    print("\nInitializing Tavily...")
+
+    tavily_client = load_tavily_client()
+
+    print("\nAll components loaded successfully.")
+
+
+# =========================================================
+# 15. NON-STREAMING API
+# =========================================================
 
 @app.post("/generate")
-def generate(request: QuestionRequest):
+def generate(
+    request: QuestionRequest
+):
 
-    answer = generate_answer(
-        model=model,
-        tokenizer=tokenizer,
-        question=request.question,
-        max_gen=request.max_gen
-    )
+    try:
 
-    return {
-        "question": request.question,
-        "answer": answer
+        # STEP 1: Retrieve context from Tavily.
+
+        context, sources = search_web_context(
+            request.question
+        )
+
+        # STEP 2: ONNX inference.
+
+        answer = generate_answer(
+            context=context,
+            question=request.question,
+            max_gen=request.max_gen
+        )
+
+        # STEP 3: Return response.
+
+        return {
+
+            "question": request.question,
+
+            "context": context,
+
+            "sources": "",
+
+            "answer": answer
+
+        }
+
+    except Exception as e:
+
+        print(
+            "Generation error:",
+            str(e)
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=str(e)
+        )
+
+
+# =========================================================
+# 16. STREAMING API
+# =========================================================
+
+MIN_CONTEXT_TERM_OVERLAP = 0.2
+
+HALLUCINATION_STOPWORDS = frozenset(
+    "a an and are as at be been being but by for from had has have "
+    "he her hers him his i if in into is it its me more most my nor "
+    "of on or our ours she so than that the their theirs them then "
+    "there these they this those to too under up us was we were what "
+    "when where which who why will with you your".split()
+)
+
+SENTENCE_BOUNDARY = re.compile(r"[.!?]\s+")
+
+
+def is_hallucinated(sentence, context):
+    """Treat very low lexical overlap with context as a rough hallucination signal."""
+
+    answer_terms = {
+        term
+        for term in re.findall(r"[a-z0-9]+", sentence.lower())
+        if len(term) > 2 and term not in HALLUCINATION_STOPWORDS
     }
+
+    if not answer_terms:
+        return False
+
+    context_terms = {
+        term
+        for term in re.findall(r"[a-z0-9]+", context.lower())
+    }
+
+    overlap = len(answer_terms & context_terms) / len(answer_terms)
+
+    return overlap < MIN_CONTEXT_TERM_OVERLAP
+
+
+def has_repeated_token(sentence):
+    """Return whether a word occurs more than twice in the current sentence."""
+
+    token_counts = {}
+
+    for token in re.findall(r"[a-z0-9]+", sentence.lower()):
+        token_counts[token] = token_counts.get(token, 0) + 1
+
+        if token_counts[token] > 2:
+            return True
+
+    return False
+
+
+def monitor_answer_stream(context, generated_text_stream):
+    """Yield sentence events, terminating on low overlap or repeated words."""
+
+    previous_text = ""
+    pending_text = ""
+
+    for current_text in generated_text_stream:
+        new_text = current_text[len(previous_text):]
+        previous_text = current_text
+        pending_text += new_text
+
+        while True:
+            boundary = SENTENCE_BOUNDARY.search(pending_text)
+
+            if boundary is None:
+                break
+
+            sentence = pending_text[:boundary.end()]
+            pending_text = pending_text[boundary.end():]
+
+            if (
+                has_repeated_token(sentence)
+                or is_hallucinated(sentence, context)
+            ):
+                yield {"signal": "<terminated>"}
+                return
+
+            yield {"token": sentence}
+
+        if has_repeated_token(pending_text):
+            yield {"signal": "<terminated>"}
+            return
+
+    if pending_text:
+        if (
+            has_repeated_token(pending_text)
+            or is_hallucinated(pending_text, context)
+        ):
+            yield {"signal": "<terminated>"}
+            return
+
+        yield {"token": pending_text}
 
 
 @app.post("/generate/stream")
-def generate_stream(request: QuestionRequest):
+def generate_stream(
+    request: QuestionRequest
+):
+
+    # Retrieve context before starting stream.
+    try:
+
+        context, sources = search_web_context(
+            request.question
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Tavily search failed: {str(e)}"
+        )
 
     def stream():
 
         try:
-            previous_text = ""
 
-            for current_text in generate_answer_stream(
-                model=model,
-                tokenizer=tokenizer,
+            # First send context and sources.
+
+            yield (
+                "data: "
+                + json.dumps({
+
+                    "context": context,
+
+                    "sources": ""
+
+                })
+                + "\n\n"
+            )
+
+            generated_text_stream = generate_answer_stream(
+                context=context,
                 question=request.question,
                 max_gen=request.max_gen
+            )
+
+            for event in monitor_answer_stream(
+                context,
+                generated_text_stream
             ):
 
-                # Send only the newly generated portion.
-                new_text = current_text[len(previous_text):]
+                if event.get("signal") == "<terminated>":
+                    yield "data: <terminated>\n\n"
+                    return
 
-                if new_text:
-                    yield f"data: {json.dumps({'token': new_text})}\n\n"
-
-                previous_text = current_text
+                yield (
+                    "data: "
+                    + json.dumps(event)
+                    + "\n\n"
+                )
 
             yield "data: [DONE]\n\n"
 
         except Exception as e:
 
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield (
+                "data: "
+                + json.dumps({
+
+                    "error": str(e)
+
+                })
+                + "\n\n"
+            )
 
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",
         headers={
+
             "Cache-Control": "no-cache",
+
             "Connection": "keep-alive",
+
             "X-Accel-Buffering": "no"
+
         }
     )
 
 
 # =========================================================
-# MAIN
+# 17. MAIN
 # =========================================================
 
 if __name__ == "__main__":
@@ -413,12 +1452,5 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=8000,
-         reload=True
+        reload=False
     )
-
-    # uvicorn.run(
-    #     app,
-    #     host="0.0.0.0",
-    #     port=8000,
-    #     reload=True
-    # )

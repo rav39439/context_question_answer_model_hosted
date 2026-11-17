@@ -4,3 +4,4 @@ numpy
 onnxruntime
 transformers
 requests
+tavily-python
